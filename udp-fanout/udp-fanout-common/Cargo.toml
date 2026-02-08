@@ -1,0 +1,14 @@
+[package]
+name = "udp-fanout-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types between userspace daemon and eBPF programs"
+
+[features]
+default = []
+# When building for userspace (std available)
+userspace = ["aya"]
+
+[dependencies]
+# Optional: only pulled in for userspace builds (eBPF builds stay no_std/no deps)
+aya = { version = "0.13", optional = true }

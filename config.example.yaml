@@ -1,0 +1,94 @@
+# udp-fanout configuration example
+#
+# Forwarding modes:
+#   tc_ebpf   - Kernel-only forwarding via TC eBPF (fastest, requires CAP_BPF)
+#   userspace - Pure userspace with recvmmsg/sendmmsg (portable fallback)
+#
+# Note: af_xdp is temporarily disabled (implementation incomplete).
+
+listeners:
+  # Example: Market data fanout via eBPF fast path
+  - name: market-data
+    bind: "0.0.0.0:9000"
+    interface: eth0
+    mode: tc_ebpf
+    downstream:
+      - name: consumer-1
+        address: "10.0.1.10:9000"
+        mac: "aa:bb:cc:dd:ee:01"       # legacy/optional (tc_ebpf uses FIB lookup)
+      - name: consumer-2
+        address: "10.0.1.11:9000"
+        mac: "aa:bb:cc:dd:ee:02"       # legacy/optional (tc_ebpf uses FIB lookup)
+      - name: consumer-3
+        address: "10.0.1.12:9000"
+        mac: "aa:bb:cc:dd:ee:03"       # legacy/optional (tc_ebpf uses FIB lookup)
+    settings:
+      max_packet_size: 1500       # MTU (use 9000 for jumbo frames)
+
+  # Example: Kubernetes-native round-robin load balancing via EndpointSlice discovery (tc_ebpf)
+  #
+  # Discovers ready endpoints for a Service and forwards each packet to exactly one
+  # downstream endpoint (round-robin), skipping unready/terminating pods.
+  - name: udp-logs-fastpath
+    bind: "0.0.0.0:5514"
+    interface: eth0
+    mode: tc_ebpf
+    kubernetes:
+      # Defaults to the pod's namespace when running in-cluster.
+      namespace: udp-fanout
+      service: udp-log-receivers
+      port: 5514
+    # downstream can be omitted when kubernetes discovery is enabled
+    settings:
+      max_packet_size: 1500
+
+  # Example: Telemetry replication via userspace (for dev/test)
+  - name: telemetry
+    bind: "0.0.0.0:5000"
+    mode: userspace
+    downstream:
+      - name: prometheus-adapter
+        address: "10.0.2.10:5000"
+      - name: datadog-agent
+        address: "10.0.2.11:5000"
+    settings:
+      max_packet_size: 9000
+      batch_size: 64              # recvmmsg/sendmmsg batch size
+      workers: 4                  # Worker threads (0 = auto)
+      pin_cpus: true              # Pin workers to CPU cores
+      recv_buf_size: 16777216     # 16MB socket recv buffer
+
+  # Example: Kubernetes-native round-robin load balancing via EndpointSlice discovery
+  #
+  # Discovers ready endpoints for a Service and sends each packet to exactly one
+  # downstream endpoint (round-robin), skipping unready/terminating pods.
+  - name: udp-logs
+    # Use a different bind port than the tc_ebpf example above.
+    bind: "0.0.0.0:5515"
+    mode: userspace
+    kubernetes:
+      # Defaults to the pod's namespace when running in-cluster.
+      namespace: udp-fanout
+      service: udp-log-receivers
+      port: 5514
+    # downstream can be omitted when kubernetes discovery is enabled
+    settings:
+      max_packet_size: 1500
+      batch_size: 64
+      workers: 0
+      pin_cpus: true
+      recv_buf_size: 16777216
+
+# Periodic health probes for downstream receivers.
+# Unhealthy receivers are temporarily removed from the eBPF forwarding table.
+health:
+  enabled: true
+  interval_secs: 5
+  timeout_secs: 2
+  protocol: icmp                  # icmp | udp_echo
+
+# Prometheus-compatible metrics endpoint.
+metrics:
+  enabled: true
+  bind: "0.0.0.0:9090"
+  path: /metrics

@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# eBPF build artifacts
+*.o
+*.ll
+/udp-fanout-ebpf/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config
+config.yaml
+!config.example.yaml
+
+# Test artifacts
+*.log
+*.pcap

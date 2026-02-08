@@ -1,0 +1,90 @@
+# MetalLB LoadBalancer Service + manual Endpoints for udp-fanout
+#
+# This creates a LoadBalancer Service with MetalLB that DNATs to the
+# dummy0 interface (10.255.0.1) on each node.
+#
+# Flow:
+#   External → MetalLB VIP (e.g., 192.168.1.100:5514)
+#   → kube-proxy DNAT → 10.255.0.1:5514 (dummy0)
+#   → TC eBPF on dummy0 → Pod IPs
+
+---
+# LoadBalancer Service (MetalLB will assign external IP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-fanout-lb
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-fanout
+  annotations:
+    # Optional: Request specific IP from MetalLB pool
+    # metallb.universe.tf/loadBalancerIPs: 192.168.1.100
+
+    # Optional: Share VIP with other services
+    # metallb.universe.tf/allow-shared-ip: udp-fanout
+spec:
+  type: LoadBalancer
+  # externalTrafficPolicy: Cluster is the default
+  # With Cluster mode, kube-proxy DNATs to backend (dummy0 IP)
+  externalTrafficPolicy: Cluster
+  ports:
+    - name: syslog
+      port: 5514           # External port
+      protocol: UDP
+      targetPort: 5514     # Must match Endpoints port
+
+---
+# Manual Endpoints pointing to dummy0 IP on ALL nodes
+# Since udp-fanout runs as DaemonSet, every node has dummy0 with 10.255.0.1
+#
+# NOTE: In a real deployment, you should automate this or use a controller
+# to dynamically update endpoints based on node IPs. For simplicity, we use
+# a static endpoint here assuming the dummy IP is consistent across nodes.
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: udp-fanout-lb  # Must match Service name
+  namespace: udp-fanout
+subsets:
+  - addresses:
+      # List all node IPs where udp-fanout DaemonSet runs
+      # Each node will have dummy0 with 10.255.0.1
+      #
+      # IMPORTANT: This is a placeholder. In production, either:
+      # 1. Use externalTrafficPolicy: Local and set endpoints to node IPs
+      # 2. Use a controller to dynamically manage this
+      # 3. For L2 mode, MetalLB sends to one node, so single endpoint works
+
+      - ip: 10.255.0.1  # Dummy interface IP (same on all nodes)
+    ports:
+      - port: 5514
+        protocol: UDP
+
+---
+# Alternative: Use a "dummy service" approach
+# Create a ClusterIP Service that selects nothing, then manually set Endpoints
+# This gives you more control over the DNAT destination
+
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: udp-fanout-backend
+#   namespace: udp-fanout
+# spec:
+#   clusterIP: 10.96.100.100  # Pick a free ClusterIP
+#   ports:
+#     - port: 5514
+#       protocol: UDP
+# ---
+# apiVersion: v1
+# kind: Endpoints
+# metadata:
+#   name: udp-fanout-backend
+#   namespace: udp-fanout
+# subsets:
+#   - addresses:
+#       - ip: 10.255.0.1  # Dummy interface
+#     ports:
+#       - port: 5514
+#         protocol: UDP

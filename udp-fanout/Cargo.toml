@@ -1,0 +1,54 @@
+[package]
+name = "udp-fanout"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight high-performance UDP fanout proxy with eBPF kernel bypass"
+license = "Apache-2.0"
+
+[[bin]]
+name = "udp-fanout"
+path = "src/main.rs"
+
+[dependencies]
+# eBPF management
+aya = { version = "0.13", features = ["async_tokio"] }
+aya-log = "0.2"
+
+# Shared types
+udp-fanout-common = { path = "../udp-fanout-common", features = ["userspace"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Kubernetes discovery (EndpointSlice watch)
+kube = { version = "0.91", features = ["runtime"] }
+k8s-openapi = { version = "0.22", features = ["v1_30"] }
+futures = "0.3"
+arc-swap = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Metrics HTTP server
+axum = "0.8"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# System interface
+libc = "0.2"
+nix = { version = "0.29", features = ["net", "signal", "socket"] }
+socket2 = { version = "0.5", features = ["all"] }
+
+# Utilities
+core_affinity = "0.8"
+byteorder = "1"

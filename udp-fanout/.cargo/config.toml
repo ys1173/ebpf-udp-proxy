@@ -1,0 +1,5 @@
+# Workspace-level cargo configuration
+
+# xtask alias: `cargo xtask build-ebpf` etc.
+[alias]
+xtask = "run --package xtask --"

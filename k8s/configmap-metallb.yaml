@@ -1,0 +1,40 @@
+# ConfigMap: udp-fanout configuration for MetalLB + dummy interface deployment
+#
+# IMPORTANT: This config uses dummy0 interface (10.255.0.1)
+# The DaemonSet init container creates this interface automatically.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: udp-fanout-config
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-fanout
+data:
+  config.yaml: |
+    listeners:
+      # Listener on dummy interface
+      # kube-proxy DNATs from MetalLB VIP → 10.255.0.1:5514
+      # TC eBPF intercepts here and redirects to pods
+      - name: syslog
+        bind: "10.255.0.1:5514"     # Listen on dummy interface IP
+        interface: dummy0            # TC eBPF attaches to dummy0
+        mode: tc_ebpf
+        kubernetes:
+          namespace: logging         # ← Update: where your receivers are
+          service: vector-aggregators # ← Update: your receiver Service name
+          port: 5514                 # ← Update: receiver port
+
+    # Health checks: Recommended for production
+    # Detects pod failures in ~5-7s (vs k8s default ~40-60s)
+    health:
+      enabled: true
+      interval_secs: 5
+      timeout_secs: 2
+      protocol: icmp
+
+    # Metrics: Prometheus endpoint
+    metrics:
+      enabled: true
+      bind: "0.0.0.0:9090"
+      path: /metrics

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "udp-fanout",
+    "udp-fanout-common",
+    "xtask",
+]
+exclude = ["udp-fanout-ebpf"]
+
+# eBPF crate is built separately via xtask (needs bpf target)
+# "udp-fanout-ebpf" is NOT a workspace member
+
+[workspace.dependencies]
+anyhow = "1"
+log = "0.4"
+thiserror = "2"

@@ -1,0 +1,128 @@
+# Example: Vector log receivers for testing udp-fanout
+#
+# This deploys 3 Vector instances that receive UDP syslog on port 5514
+# and forward to a blackhole sink (for testing) or Loki (for production).
+#
+# Usage:
+#   kubectl apply -f example-receivers.yaml
+#   kubectl -n udp-fanout logs -l app=udp-receiver --tail=10
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-receiver-config
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-receiver
+data:
+  vector.yaml: |
+    # Vector configuration for UDP syslog receiver
+    sources:
+      udp_in:
+        type: socket
+        address: "0.0.0.0:40514"
+        mode: udp
+        max_length: 65536
+
+    # For testing: blackhole sink with stats every 2s
+    sinks:
+      blackhole:
+        type: blackhole
+        inputs: ["udp_in"]
+        print_interval_secs: 2
+
+    # For production: uncomment Loki sink
+    # sinks:
+    #   loki:
+    #     type: loki
+    #     inputs: ["udp_in"]
+    #     endpoint: http://loki:3100
+    #     encoding:
+    #       codec: json
+    #     labels:
+    #       job: syslog
+
+    # Expose metrics for Prometheus
+    api:
+      enabled: true
+      address: "0.0.0.0:8686"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-receiver
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-receiver
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: udp-receiver
+  template:
+    metadata:
+      labels:
+        app: udp-receiver
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8686"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: vector
+          image: timberio/vector:latest-alpine
+          args: ["--config", "/etc/vector/vector.yaml"]
+          ports:
+            - name: udp
+              containerPort: 40514
+              protocol: UDP
+            - name: metrics
+              containerPort: 8686
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          # Optional: readiness probe (Vector's HTTP API)
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: vector-receiver-config
+
+---
+# Headless Service - creates EndpointSlices for udp-fanout discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-receivers
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-receiver
+spec:
+  clusterIP: None  # Headless service
+  selector:
+    app: udp-receiver
+  ports:
+    - name: udp-logs
+      port: 40514
+      targetPort: 40514
+      protocol: UDP
+    - name: metrics
+      port: 8686
+      targetPort: 8686
+      protocol: TCP

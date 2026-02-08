@@ -1,0 +1,27 @@
+[package]
+name = "udp-fanout-ebpf"
+version = "0.1.0"
+edition = "2021"
+description = "TC eBPF program for kernel-space UDP fanout"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+udp-fanout-common = { path = "../udp-fanout-common" }
+
+[[bin]]
+name = "udp-fanout-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2       # eBPF verifier needs optimized code
+debug = false
+overflow-checks = false
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -1,0 +1,27 @@
+[package]
+name = "udp-fanout-ebpf-xdp"
+version = "0.1.0"
+edition = "2021"
+description = "XDP eBPF program for AF_XDP-based UDP forwarding"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+udp-fanout-common = { path = "../udp-fanout-common" }
+
+[[bin]]
+name = "udp-fanout-ebpf-xdp"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2       # eBPF verifier needs optimized code
+debug = false
+overflow-checks = false
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
