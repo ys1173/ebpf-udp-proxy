@@ -1,95 +1,129 @@
-# udp-fanout
+# ebpf-udp-proxy
 
-High-performance UDP packet fanout proxy with eBPF fast path for Kubernetes.
+High-performance UDP load-balancing proxy with eBPF kernel bypass for Kubernetes.
 
-Receives UDP datagrams on one or more listeners and forwards each packet to exactly one downstream receiver using round-robin load balancing — all in kernel space with TC eBPF for line-rate performance.
+Receives UDP datagrams on one or more listeners and forwards each packet to exactly one downstream receiver using round-robin selection. Three forwarding paths cover different deployment scenarios — from line-rate kernel-only forwarding to MetalLB-compatible AF_XDP to portable userspace fallback.
+
+## Forwarding Modes
+
+### TC eBPF (`tc_ebpf`)
+
+Kernel-only forwarding via TC ingress hook. The eBPF program rewrites L3/L4 headers, performs a FIB lookup for routing, and calls `bpf_redirect_neigh()` to send the packet directly to the downstream pod's veth interface. The packet never enters userspace on the proxy node.
+
+Best for: bare-metal or cloud deployments where the proxy runs on the host network without MetalLB.
+
+### AF_XDP (`af_xdp`)
+
+XDP program on the physical NIC redirects matching UDP packets to an AF_XDP socket via XSKMAP. Userspace reads complete L2 frames from shared UMEM ring buffers (zero-copy receive), parses headers, extracts the UDP payload, and forwards via `sendto` to one downstream. All non-matching traffic (ARP, TCP, other UDP) passes through `XDP_PASS` to the kernel stack untouched.
+
+Best for: Kubernetes with MetalLB L2 mode. Because ARP passes through normally, MetalLB can claim virtual IPs without conflict. No dummy interface workaround needed.
+
+### Userspace (`userspace`)
+
+Pure userspace path using `recvmmsg`/`sendmmsg` batched I/O with SO_REUSEPORT multi-worker threads and optional CPU pinning. No eBPF, no root required beyond binding the listen port.
+
+Best for: development, testing, or environments where eBPF is unavailable.
 
 ## Features
 
-- **Kernel-space forwarding**: TC eBPF fast path with `bpf_redirect_neigh()` — zero userspace copies, line-rate throughput
-- **Kubernetes-native**: Automatic endpoint discovery via EndpointSlice watch — no manual configuration
-- **Round-robin load balancing**: Per-CPU counters for lock-free packet distribution
-- **Health monitoring**: Active ICMP/UDP probes to detect failed receivers in ~5-7 seconds (vs k8s default ~40-60s)
-- **Userspace fallback**: Pure userspace mode with `recvmmsg`/`sendmmsg` batching for portability
-- **Zero configuration**: Discovers downstream IPs automatically from Kubernetes Service selectors
-
-## Use Cases
-
-- **Log aggregation**: Distribute syslog/GELF/fluent-bit traffic across Vector/Logstash/Loki instances
-- **Telemetry replication**: Fan out StatsD/OpenTelemetry metrics to multiple collectors
-- **Market data distribution**: Low-latency fanout for UDP multicast streams (finance/trading)
-- **DNS load balancing**: Distribute DNS queries across resolver pools
+- **Round-robin load balancing**: One packet → one downstream, cycling through available receivers. Per-CPU counters (eBPF) or atomics (userspace/AF_XDP) for lock-free distribution
+- **Kubernetes EndpointSlice discovery**: Automatic downstream discovery from Service selectors — no manual IP configuration
+- **Health monitoring**: Active ICMP ping or UDP echo probes with automatic disable after 3 consecutive failures
+- **Prometheus metrics**: Per-listener packet/byte counters with mode labels, plus AF_XDP-specific ring buffer metrics
+- **No buffering, no backpressure**: Fire-and-forget forwarding. If the send buffer is full (EAGAIN), the packet is dropped and counted
+- **YAML configuration**: Simple config with per-listener mode selection, K8s discovery, and tuning knobs
 
 ## Architecture
 
 ```
-External sender → Host NIC (TC ingress eBPF)
-                        ↓ bpf_redirect_neigh
-                  Pod veth interfaces
-                        ↓ round-robin
-            ┌───────────┼───────────┐
-         pod-1       pod-2       pod-3
-      receiver    receiver    receiver
+                    ┌─────────────────────────────────────────────┐
+                    │              Forwarding Modes                │
+                    ├─────────────┬──────────────┬────────────────┤
+                    │  TC eBPF    │   AF_XDP     │   Userspace    │
+                    │             │              │                │
+  Incoming UDP ───► │ TC ingress  │ XDP hook     │ recvmmsg()     │
+                    │ FIB lookup  │ XSKMAP redir │ on UDP socket  │
+                    │ redirect_   │ UMEM rx ring │                │
+                    │ neigh()     │ parse + strip│                │
+                    │             │ headers      │                │
+  Outgoing UDP ◄── │ direct to   │ sendto()     │ sendto()       │
+                    │ pod veth    │ round-robin  │ round-robin    │
+                    └─────────────┴──────────────┴────────────────┘
+                                        │
+                            ┌───────────┼───────────┐
+                         pod-1       pod-2       pod-3
+                       receiver    receiver    receiver
 ```
-
-**How it works:**
-1. Incoming UDP packets hit the host NIC with TC eBPF program attached to ingress
-2. eBPF program matches destination port → looks up downstream pod IP from map
-3. Rewrites L3/L4 headers (dst IP/port), performs FIB lookup for routing
-4. `bpf_redirect_neigh()` redirects packet to pod veth, kernel resolves neighbor/MAC automatically
-5. Zero copies, zero context switches — packet never enters userspace on the proxy node
-
-## Performance
-
-- **Throughput**: Line-rate forwarding (tested at 10Gbps+)
-- **Latency**: Sub-microsecond kernel forwarding (vs ~100µs userspace proxy overhead)
-- **CPU overhead**: <5% on modern CPUs at 1M pps
-- **Scalability**: Handles 1000+ downstream endpoints per listener
 
 ## Quick Start
 
 ### Prerequisites
 
-- Kubernetes 1.19+ (EndpointSlice API)
-- Linux kernel 5.10+ (for `bpf_redirect_neigh`)
-- Host network mode (DaemonSet with `hostNetwork: true`)
+- Rust stable (1.75+) + nightly (for eBPF programs)
+- `bpf-linker`: `cargo install bpf-linker`
+- System packages: `clang`, `llvm`, `libelf-dev`
+- Linux kernel 5.10+ (for `bpf_redirect_neigh` in TC mode)
+- Linux kernel 4.18+ (for AF_XDP mode)
+- Kubernetes 1.19+ (for EndpointSlice discovery)
 
-### Deploy on Kubernetes
-
-```bash
-# 1. Apply RBAC for EndpointSlice read access
-kubectl apply -f k8s/rbac.yaml
-
-# 2. Deploy udp-fanout as DaemonSet
-kubectl apply -f k8s/daemonset.yaml
-
-# 3. Deploy downstream receivers (example: Vector)
-kubectl apply -f k8s/example-receivers.yaml
-
-# 4. Verify eBPF program attached
-kubectl -n udp-fanout logs daemonset/udp-fanout | grep "attached TC eBPF"
-```
-
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for detailed Kubernetes deployment guide.
-
-**For MetalLB LoadBalancer integration**: See [docs/METALLB_DEPLOYMENT.md](docs/METALLB_DEPLOYMENT.md) for deploying with MetalLB L2 VIP using a dummy interface approach.
-
-### Local Testing (Userspace Mode)
+### Build
 
 ```bash
-# Build
+# Build everything: TC eBPF + XDP eBPF + userspace daemon
 cargo xtask build --release
 
-# Run in userspace mode (no eBPF, no root required)
+# Outputs:
+#   target/release/udp-fanout       # userspace daemon
+#   target/udp-fanout-ebpf          # TC eBPF program (BPF ELF)
+#   target/udp-fanout-ebpf-xdp     # XDP eBPF program (BPF ELF)
+
+# Build individual components
+cargo xtask build-ebpf --release       # TC eBPF only
+cargo xtask build-ebpf-xdp --release   # XDP eBPF only
+```
+
+### Run Locally (Userspace Mode)
+
+```bash
 ./target/release/udp-fanout --config config.example.yaml
 
 # Send test traffic
 echo "test" | nc -u localhost 5514
 ```
 
+### Run with TC eBPF (Requires Root)
+
+```bash
+sudo ./target/release/udp-fanout \
+  --config config.yaml \
+  --ebpf-program target/udp-fanout-ebpf
+```
+
+### Run with AF_XDP (Requires Root)
+
+```bash
+sudo ./target/release/udp-fanout \
+  --config config.yaml \
+  --xdp-program target/udp-fanout-ebpf-xdp
+```
+
 ## Configuration
 
-Minimal example (Kubernetes service discovery):
+### Userspace Mode
+
+```yaml
+listeners:
+  - name: syslog
+    bind: "0.0.0.0:5514"
+    mode: userspace
+    downstream:
+      - name: sink-1
+        address: "10.0.0.1:5514"
+      - name: sink-2
+        address: "10.0.0.2:5514"
+```
+
+### TC eBPF with Kubernetes Discovery
 
 ```yaml
 listeners:
@@ -113,103 +147,114 @@ metrics:
   bind: "0.0.0.0:9090"
 ```
 
-See [config.example.yaml](config.example.yaml) for full options including static downstream configuration.
+### AF_XDP with MetalLB
 
-## Building
+```yaml
+listeners:
+  - name: market-data
+    bind: "0.0.0.0:9000"
+    interface: eth0
+    mode: af_xdp
+    kubernetes:
+      namespace: trading
+      service: udp-receivers
+      port: 9000
 
-### Requirements
+health:
+  enabled: true
+  protocol: udp_echo
 
-- Rust stable (1.75+) + nightly (for eBPF)
-- `bpf-linker` for eBPF program linking
-- System packages: `clang`, `llvm`, `libelf-dev`
-
-### Build Commands
-
-```bash
-# Install bpf-linker
-cargo install bpf-linker
-
-# Build both eBPF and userspace
-cargo xtask build --release
-
-# Outputs:
-#   target/release/udp-fanout          # userspace daemon
-#   target/udp-fanout-ebpf             # eBPF program (BPF ELF)
+metrics:
+  enabled: true
+  bind: "0.0.0.0:9090"
 ```
 
-### Docker Build
+See [config.example.yaml](config.example.yaml) for all options including batch size, worker count, recv buffer size, and max packet size.
+
+## Kubernetes Deployment
 
 ```bash
-# Multi-stage build (builds eBPF + userspace)
-docker build -t udp-fanout:latest .
+# Apply RBAC for EndpointSlice read access
+kubectl apply -f k8s/rbac.yaml
 
-# Or use pre-built binaries (faster)
-docker build -t udp-fanout:latest -f Dockerfile.runtime .
+# Deploy as DaemonSet
+kubectl apply -f k8s/daemonset.yaml
+
+# For MetalLB deployments (AF_XDP mode)
+kubectl apply -f k8s/service-metallb.yaml
+kubectl apply -f k8s/daemonset.yaml  # with mode: af_xdp in configmap
 ```
-## Documentation
 
-- **[Deployment Guide](docs/DEPLOYMENT.md)**: Kubernetes deployment, troubleshooting, production best practices
-- **[MetalLB Deployment](docs/METALLB_DEPLOYMENT.md)**: Deploy with MetalLB L2 LoadBalancer and VIP redundancy
-- **[Architecture](docs/ARCHITECTURE.md)**: Deep dive into eBPF packet flow, round-robin algorithm, FIB lookup
-- **[Configuration Reference](docs/CONFIGURATION.md)**: All config options explained
-- **[Development Guide](docs/DEVELOPMENT.md)**: Building, testing, contributing
+The DaemonSet requires `hostNetwork: true` and capabilities `CAP_NET_ADMIN`, `CAP_BPF`, `CAP_SYS_RESOURCE` for eBPF/XDP attachment.
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full deployment guide and [docs/METALLB_DEPLOYMENT.md](docs/METALLB_DEPLOYMENT.md) for MetalLB-specific details.
 
 ## Monitoring
 
-Prometheus metrics exposed on `:9090/metrics`:
+Prometheus metrics on `:9090/metrics`:
 
 ```
-udp_fanout_packets_received_total{listener="syslog"}
-udp_fanout_packets_forwarded_total{listener="syslog"}
-udp_fanout_packets_dropped_total{listener="syslog"}
-udp_fanout_downstream_active{listener="syslog"}
-udp_fanout_downstream_health{listener="syslog",endpoint="10.42.0.5:5514"}
+udp_fanout_packets_received_total{listener="syslog",mode="tc_ebpf"} 1584302
+udp_fanout_packets_forwarded_total{listener="syslog",mode="tc_ebpf"} 1584298
+udp_fanout_packets_dropped_total{listener="syslog",mode="tc_ebpf"} 4
+udp_fanout_bytes_received_total{listener="syslog",mode="tc_ebpf"} 792151000
+udp_fanout_bytes_forwarded_total{listener="syslog",mode="tc_ebpf"} 792149000
+
+# AF_XDP-specific
+udp_fanout_afxdp_rx_ring_empty_total{listener="market-data",mode="af_xdp"} 12
+udp_fanout_afxdp_fill_ring_full_total{listener="market-data",mode="af_xdp"} 0
+udp_fanout_afxdp_parse_errors_total{listener="market-data",mode="af_xdp"} 0
 ```
 
-## Comparison
+## Docker Build
 
-Comparison for UDP proxy forwarding workloads:
+```bash
+# Multi-stage build (eBPF nightly + userspace stable + runtime)
+docker build -t ebpf-udp-proxy:latest .
+```
 
-| Feature | udp-fanout (TC eBPF) | NGINX | Envoy | HAProxy |
-|---------|----------------------|-------|-------|---------|
-| **Throughput** | Very High | Medium | Medium-High | Low-Medium |
-| **Latency** | Very Low | Medium | Medium | Low |
-| **CPU overhead** | Very Low | Medium-High | Low-Medium | Medium-High |
-| **Data plane** | Kernel (eBPF) | Userspace | Userspace | Userspace |
-| **Load balancing** | Round-robin | Round-robin, hash | Consistent hash, ring hash | Round-robin, least-conn, hash |
-| **Stateful** | No (stateless) | Yes (per-connection) | Yes (per-connection) | Yes (per-connection) |
-| **K8s integration** | Native (EndpointSlice) | Manual config | Service mesh (xDS) | Manual config |
-| **Health checks** | Active (ICMP/UDP) | Passive | Active (HTTP/gRPC) | Active (TCP/HTTP) |
-| **Config complexity** | Low (YAML) | Medium (nginx.conf) | High (xDS/Envoy API) | Medium (HAProxy cfg) |
-| **Observability** | Prometheus | Logs, Prometheus | Rich (traces, stats) | Logs, Prometheus |
-| **Best for** | High-throughput fanout | General L4/L7 proxy | Service mesh | L4/L7 load balancing |
+## Project Structure
 
-**Why eBPF is faster for UDP fanout:**
-- Zero userspace copies — packet stays in kernel from NIC to pod veth
-- No context switches — eBPF runs in softirq context at packet arrival
-- Stateless forwarding — no connection tracking overhead (UDP is connectionless)
-- Direct redirect — `bpf_redirect_neigh()` bypasses full network stack traversal
+```
+├── udp-fanout/                  # Userspace daemon
+│   └── src/
+│       ├── main.rs              # CLI, lifecycle, mode dispatch
+│       ├── config.rs            # YAML config parsing and validation
+│       ├── af_xdp.rs            # AF_XDP socket, UMEM, ring buffers, forwarding
+│       ├── xdp_manager.rs       # XDP program loading and XSKMAP management
+│       ├── ebpf_manager.rs      # TC eBPF program loading and map management
+│       ├── userspace.rs         # recvmmsg/sendmmsg multi-worker forwarding
+│       ├── kubernetes.rs        # EndpointSlice watcher for downstream discovery
+│       ├── health.rs            # ICMP/UDP health probes
+│       └── metrics.rs           # Prometheus metrics endpoint
+├── udp-fanout-ebpf/             # TC eBPF program (bpfel-unknown-none target)
+│   └── src/
+│       ├── main.rs              # TC classifier entry, maps
+│       └── fanout.rs            # Round-robin, FIB lookup, bpf_redirect_neigh
+├── udp-fanout-ebpf-xdp/        # XDP eBPF program (bpfel-unknown-none target)
+│   └── src/
+│       └── main.rs              # XDP hook, XSKMAP redirect, port filter
+├── udp-fanout-common/           # Shared no_std types (eBPF + userspace)
+│   └── src/
+│       └── lib.rs               # Map types, constants, protocol defs
+├── xtask/                       # Build helper (cargo xtask)
+├── k8s/                         # Kubernetes manifests
+├── docs/                        # Deployment and architecture docs
+└── Dockerfile                   # Multi-stage container build
+```
 
 ## Limitations
 
-- **UDP only**: TCP not supported (use kernel's built-in load balancing for TCP)
-- **Round-robin only**: No weighted/least-connections (eBPF complexity constraints)
-- **Host network required**: Needs direct NIC access for TC attach
-- **Single packet per connection**: No connection tracking (stateless forwarding)
+- UDP only — TCP is not supported (use kube-proxy or a general-purpose L4 proxy for TCP)
+- Round-robin only — no weighted, least-connections, or hash-based balancing
+- Host network required — needs direct NIC access for TC/XDP attachment
+- Stateless — no connection tracking, no session affinity
+- AF_XDP currently uses copy mode — zero-copy mode can be enabled for NICs with driver support
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE)
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Apache License 2.0 — see [LICENSE](LICENSE)
 
 ## Credits
 
-Built with:
-- [Aya](https://aya-rs.dev/) - Rust eBPF library
-- [Tokio](https://tokio.rs/) - Async runtime
-- [kube-rs](https://kube.rs/) - Kubernetes client
-
-Inspired by Cilium's eBPF-based service load balancing.
+Built with [Aya](https://aya-rs.dev/) (Rust eBPF), [Tokio](https://tokio.rs/) (async runtime), and [kube-rs](https://kube.rs/) (Kubernetes client). Inspired by Envoy's UDP proxy architecture and Cilium's eBPF service load balancing.
