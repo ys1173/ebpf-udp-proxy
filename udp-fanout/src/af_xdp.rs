@@ -1,15 +1,24 @@
-//! AF_XDP zero-copy forwarding path.
+//! AF_XDP high-performance forwarding path.
 //!
 //! Combines XDP redirect to AF_XDP socket (zero-copy receive) with userspace
-//! round-robin forwarding via sendto. This path offers near-kernel performance
+//! round-robin forwarding via sendmmsg. This path offers near-kernel performance
 //! for receive while retaining full flexibility for packet processing in userspace.
 //!
 //! Architecture:
 //! 1. XDP program classifies packets by port and redirects to AF_XDP socket
 //! 2. Userspace reads complete L2 frames from the RX ring (shared UMEM)
 //! 3. Parses Eth/IP/UDP headers, extracts UDP payload
-//! 4. Forwards payload via sendto to one downstream (round-robin)
+//! 4. Forwards payload via sendmmsg to one downstream per packet (round-robin)
 //! 5. Consumed buffers are returned to the fill ring for reuse
+//!
+//! Performance optimizations:
+//! - Zero-copy receive (XDP_ZEROCOPY with XDP_COPY fallback)
+//! - Batched sends via sendmmsg (single syscall for entire batch)
+//! - Busy-spinning on RX ring (no poll() syscall in hot path)
+//! - Per-batch ArcSwap load (amortized downstream snapshot)
+//! - Pre-cached sockaddrs (no per-packet allocation)
+//! - Local stats counters flushed per batch (reduced atomic contention)
+//! - CPU pinning and SO_BUSY_POLL for cache locality and low latency
 //!
 //! MetalLB compatibility:
 //! The XDP program passes all non-matching traffic (ARP, TCP, other UDP)
@@ -45,6 +54,17 @@ const NUM_FRAMES: u32 = RING_SIZE * 2;
 /// Total UMEM size in bytes.
 const UMEM_SIZE: usize = (NUM_FRAMES * FRAME_SIZE) as usize;
 
+/// Maximum packets to process per batch. Larger batches amortize
+/// syscall overhead (one sendmmsg per batch instead of N sendto).
+const MAX_BATCH_SIZE: u32 = 256;
+
+/// Number of busy-spin iterations before falling back to poll().
+/// Tuned so the spin takes roughly 10-50µs on modern CPUs.
+const BUSY_SPIN_ITERS: u32 = 1000;
+
+/// Send socket buffer size (4 MB). Large enough to absorb send bursts.
+const SEND_BUF_SIZE: usize = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Linux AF_XDP Constants (from <linux/if_xdp.h>)
 // ---------------------------------------------------------------------------
@@ -52,9 +72,9 @@ const UMEM_SIZE: usize = (NUM_FRAMES * FRAME_SIZE) as usize;
 const SOL_XDP: i32 = 283;
 const XDP_MMAP_OFFSETS: i32 = 1;
 const XDP_RX_RING: i32 = 2;
-const XDP_UMEM_REG: i32 = 4;
-const XDP_UMEM_FILL_RING: i32 = 5;
-const XDP_UMEM_COMPLETION_RING: i32 = 6;
+const XDP_UMEM_REG: i32 = 3;
+const XDP_UMEM_FILL_RING: i32 = 4;
+const XDP_UMEM_COMPLETION_RING: i32 = 5;
 const XDP_STATISTICS: i32 = 7;
 
 // mmap page offsets for each ring
@@ -66,6 +86,11 @@ const XDP_UMEM_PGOFF_COMPLETION_RING: i64 = 0x180000000;
 // Bind flags
 const XDP_COPY: u16 = 1 << 1;
 const XDP_ZEROCOPY: u16 = 1 << 2;
+
+// Busy poll socket options (from <linux/socket.h>)
+const SO_BUSY_POLL: i32 = 46;
+const SO_PREFER_BUSY_POLL: i32 = 69;
+const SO_BUSY_POLL_BUDGET: i32 = 70;
 
 // ---------------------------------------------------------------------------
 // AF_XDP Kernel Structs (repr(C) for FFI)
@@ -145,16 +170,19 @@ unsafe impl Send for RingBuffer {}
 
 impl RingBuffer {
     /// Read the producer index (acquire ordering for consumer reads).
+    #[inline(always)]
     fn load_producer(&self) -> u32 {
         unsafe { core::ptr::read_volatile(self.producer) }
     }
 
     /// Read the consumer index (acquire ordering for producer reads).
+    #[inline(always)]
     fn load_consumer(&self) -> u32 {
         unsafe { core::ptr::read_volatile(self.consumer) }
     }
 
     /// Write the producer index (release ordering).
+    #[inline(always)]
     fn store_producer(&self, val: u32) {
         unsafe {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
@@ -163,6 +191,7 @@ impl RingBuffer {
     }
 
     /// Write the consumer index (release ordering).
+    #[inline(always)]
     fn store_consumer(&self, val: u32) {
         unsafe {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
@@ -210,6 +239,12 @@ impl XskSocket {
         }
 
         info!(fd, "created AF_XDP socket");
+
+        // --- Enable busy polling on the AF_XDP socket ---
+        // SO_PREFER_BUSY_POLL tells the kernel to prefer busy-polling over IRQ
+        // SO_BUSY_POLL sets the busy-poll timeout in microseconds
+        // SO_BUSY_POLL_BUDGET sets max packets to process per busy-poll cycle
+        Self::try_set_busy_poll(fd);
 
         // --- Allocate UMEM ---
         let umem_ptr = unsafe {
@@ -368,48 +403,14 @@ impl XskSocket {
         };
 
         // --- Bind to interface + queue ---
-        let sxdp = SockaddrXdp {
-            sxdp_family: libc::AF_XDP as u16,
-            sxdp_flags: XDP_COPY, // Copy mode for broad compatibility; zero-copy can be enabled later
-            sxdp_ifindex: ifindex,
-            sxdp_queue_id: queue_id,
-            sxdp_shared_umem_fd: 0,
-        };
-
-        let ret = unsafe {
-            libc::bind(
-                fd,
-                &sxdp as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
-            )
-        };
-        if ret < 0 {
-            // Try without XDP_COPY flag (some older kernels)
-            let sxdp_fallback = SockaddrXdp {
-                sxdp_flags: 0,
-                ..sxdp
-            };
-            let ret2 = unsafe {
-                libc::bind(
-                    fd,
-                    &sxdp_fallback as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
-                )
-            };
-            if ret2 < 0 {
-                bail!(
-                    "bind AF_XDP socket to ifindex={} queue={}: {}",
-                    ifindex,
-                    queue_id,
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
+        // Try zero-copy first for best performance, then copy mode for compatibility
+        let bind_mode = Self::bind_socket(fd, ifindex, queue_id)?;
 
         info!(
             ifindex,
             queue_id,
             ring_size,
+            mode = bind_mode,
             "AF_XDP socket bound"
         );
 
@@ -421,6 +422,144 @@ impl XskSocket {
             rx_ring,
             ring_size,
         })
+    }
+
+    /// Try to bind with zero-copy, then copy mode, then default.
+    fn bind_socket(fd: RawFd, ifindex: u32, queue_id: u32) -> Result<&'static str> {
+        // Try zero-copy first (best performance — NIC DMA's directly into UMEM)
+        let sxdp_zc = SockaddrXdp {
+            sxdp_family: libc::AF_XDP as u16,
+            sxdp_flags: XDP_ZEROCOPY,
+            sxdp_ifindex: ifindex,
+            sxdp_queue_id: queue_id,
+            sxdp_shared_umem_fd: 0,
+        };
+
+        let ret = unsafe {
+            libc::bind(
+                fd,
+                &sxdp_zc as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            return Ok("zero-copy");
+        }
+        let zc_err = std::io::Error::last_os_error();
+        warn!(
+            error = %zc_err,
+            "XDP_ZEROCOPY bind failed, trying XDP_COPY mode"
+        );
+
+        // Fall back to copy mode
+        let sxdp_copy = SockaddrXdp {
+            sxdp_flags: XDP_COPY,
+            ..sxdp_zc
+        };
+
+        let ret = unsafe {
+            libc::bind(
+                fd,
+                &sxdp_copy as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            return Ok("copy");
+        }
+        let copy_err = std::io::Error::last_os_error();
+        warn!(
+            error = %copy_err,
+            "XDP_COPY bind failed, trying default mode"
+        );
+
+        // Final fallback — no flags
+        let sxdp_default = SockaddrXdp {
+            sxdp_flags: 0,
+            ..sxdp_zc
+        };
+
+        let ret = unsafe {
+            libc::bind(
+                fd,
+                &sxdp_default as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            bail!(
+                "bind AF_XDP socket to ifindex={} queue={}: zero-copy: {}, copy: {}, default: {}",
+                ifindex,
+                queue_id,
+                zc_err,
+                copy_err,
+                std::io::Error::last_os_error()
+            );
+        }
+
+        Ok("default")
+    }
+
+    /// Try to enable busy polling on the AF_XDP socket.
+    /// This is best-effort — fails silently on older kernels.
+    fn try_set_busy_poll(fd: RawFd) {
+        // Enable busy poll preference
+        let enable: i32 = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_PREFER_BUSY_POLL,
+                &enable as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            debug!(
+                "SO_PREFER_BUSY_POLL not supported: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Set busy poll timeout (microseconds)
+        let timeout_us: i32 = 20; // 20µs busy poll
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_BUSY_POLL,
+                &timeout_us as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            debug!(
+                "SO_BUSY_POLL not supported: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Set busy poll budget (max packets per poll)
+        let budget: i32 = 256;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_BUSY_POLL_BUDGET,
+                &budget as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            debug!(
+                "SO_BUSY_POLL_BUDGET not supported: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        info!("AF_XDP busy polling enabled (timeout={}µs, budget={})", timeout_us, budget);
     }
 
     /// Pre-fill the fill ring with UMEM frame addresses.
@@ -452,6 +591,7 @@ impl XskSocket {
     ///
     /// Returns descriptors (addr, len) of received packets in the UMEM.
     /// Caller must process packets and then call `refill()` to return frames.
+    #[inline(always)]
     fn poll_rx(&mut self, batch: &mut Vec<(u64, u32)>) -> usize {
         batch.clear();
 
@@ -463,12 +603,12 @@ impl XskSocket {
             return 0;
         }
 
-        // Ensure memory ordering
+        // Ensure memory ordering — acquire fence before reading descriptors
         unsafe {
             core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
         }
 
-        let to_read = available.min(64); // Process up to 64 at a time
+        let to_read = available.min(MAX_BATCH_SIZE);
 
         for i in 0..to_read {
             let idx = (cons.wrapping_add(i) & self.rx_ring.mask) as usize;
@@ -490,6 +630,7 @@ impl XskSocket {
     }
 
     /// Return consumed frame addresses to the fill ring.
+    #[inline(always)]
     fn refill(&mut self, addrs: &[u64]) -> Result<()> {
         if addrs.is_empty() {
             return Ok(());
@@ -536,6 +677,7 @@ impl XskSocket {
     /// Read a packet's data from the UMEM.
     ///
     /// Returns a slice into the mmap'd UMEM memory (zero-copy read).
+    #[inline(always)]
     fn packet_data(&self, addr: u64, len: u32) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(self.umem_ptr.add(addr as usize), len as usize)
@@ -571,6 +713,7 @@ impl Drop for XskSocket {
 ///
 /// Returns (payload_offset, payload_len) into the frame data,
 /// or None if the frame is not a valid IPv4/UDP packet.
+#[inline(always)]
 fn parse_udp_payload(frame: &[u8]) -> Option<(usize, usize)> {
     // Minimum: Eth(14) + IP(20) + UDP(8) = 42
     if frame.len() < 42 {
@@ -597,10 +740,6 @@ fn parse_udp_payload(frame: &[u8]) -> Option<(usize, usize)> {
         // Not UDP
         return None;
     }
-
-    // IP total length (for validation)
-    let ip_tot_len =
-        u16::from_be_bytes([frame[ip_start + 2], frame[ip_start + 3]]) as usize;
 
     // UDP header
     let udp_start = ip_start + ip_hdr_len;
@@ -703,10 +842,10 @@ impl AfXdpForwarder {
             )
         });
 
-        let bind_port = config.bind.port();
         let shutdown_clone = shutdown.clone();
         let stats_clone = stats.clone();
         let name = config.name.clone();
+        let pin_cpus = config.settings.pin_cpus;
 
         info!(
             listener = %name,
@@ -715,13 +854,28 @@ impl AfXdpForwarder {
             xsk_fd,
             downstreams = downstreams.load().len(),
             ring_size = RING_SIZE,
+            batch_size = MAX_BATCH_SIZE,
             kubernetes = config.kubernetes.is_some(),
+            pin_cpus,
             "starting AF_XDP forwarder"
         );
 
         let thread = thread::Builder::new()
-            .name(format!("afxdp-{}", name))
+            .name(format!("afxdp-{}-q{}", name, queue_id))
             .spawn(move || {
+                // Pin to CPU core matching queue_id for NUMA locality
+                if pin_cpus {
+                    if let Some(core_id) = (core_affinity::CoreId { id: queue_id as usize }).into() {
+                        core_affinity::set_for_current(core_id);
+                        info!(
+                            listener = %name,
+                            queue_id,
+                            core = queue_id,
+                            "AF_XDP worker pinned to CPU core"
+                        );
+                    }
+                }
+
                 if let Err(e) = af_xdp_worker(
                     xsk,
                     &downstreams,
@@ -758,10 +912,79 @@ impl AfXdpForwarder {
 }
 
 // ---------------------------------------------------------------------------
+// Local Stats — batch-flush to avoid atomic contention per packet
+// ---------------------------------------------------------------------------
+
+/// Thread-local stats counters, flushed to shared atomics once per batch.
+struct LocalStats {
+    pkts_received: u64,
+    pkts_forwarded: u64,
+    pkts_dropped: u64,
+    pkts_no_healthy: u64,
+    bytes_received: u64,
+    bytes_forwarded: u64,
+    parse_errors: u64,
+}
+
+impl LocalStats {
+    fn new() -> Self {
+        Self {
+            pkts_received: 0,
+            pkts_forwarded: 0,
+            pkts_dropped: 0,
+            pkts_no_healthy: 0,
+            bytes_received: 0,
+            bytes_forwarded: 0,
+            parse_errors: 0,
+        }
+    }
+
+    /// Flush local counters to shared atomics and reset.
+    #[inline]
+    fn flush(&mut self, stats: &AfXdpStats) {
+        if self.pkts_received > 0 {
+            stats.pkts_received.fetch_add(self.pkts_received, Ordering::Relaxed);
+            self.pkts_received = 0;
+        }
+        if self.pkts_forwarded > 0 {
+            stats.pkts_forwarded.fetch_add(self.pkts_forwarded, Ordering::Relaxed);
+            self.pkts_forwarded = 0;
+        }
+        if self.pkts_dropped > 0 {
+            stats.pkts_dropped.fetch_add(self.pkts_dropped, Ordering::Relaxed);
+            self.pkts_dropped = 0;
+        }
+        if self.pkts_no_healthy > 0 {
+            stats.pkts_no_healthy.fetch_add(self.pkts_no_healthy, Ordering::Relaxed);
+            self.pkts_no_healthy = 0;
+        }
+        if self.bytes_received > 0 {
+            stats.bytes_received.fetch_add(self.bytes_received, Ordering::Relaxed);
+            self.bytes_received = 0;
+        }
+        if self.bytes_forwarded > 0 {
+            stats.bytes_forwarded.fetch_add(self.bytes_forwarded, Ordering::Relaxed);
+            self.bytes_forwarded = 0;
+        }
+        if self.parse_errors > 0 {
+            stats.parse_errors.fetch_add(self.parse_errors, Ordering::Relaxed);
+            self.parse_errors = 0;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AF_XDP Worker
 // ---------------------------------------------------------------------------
 
 /// Main AF_XDP receive + forward loop.
+///
+/// Hot path optimizations:
+/// - Busy-spins on RX ring producer pointer (no poll() syscall)
+/// - Batches sends into a single sendmmsg() syscall
+/// - Loads downstream snapshot once per batch (not per packet)
+/// - Uses local stats counters flushed per batch
+/// - Pre-caches sockaddr for each downstream
 fn af_xdp_worker(
     mut xsk: XskSocket,
     downstreams: &ArcSwap<Vec<SocketAddr>>,
@@ -777,11 +1000,20 @@ fn af_xdp_worker(
         Some(socket2::Protocol::UDP),
     )
     .context("creating send socket")?;
-    // Set non-blocking for sendto
+
+    // Set non-blocking for sendto/sendmmsg
     send_sock.set_nonblocking(true)?;
+
+    // Enlarge send buffer to absorb bursts
+    if let Err(e) = send_sock.set_send_buffer_size(SEND_BUF_SIZE) {
+        warn!(error = %e, "failed to set SO_SNDBUF (continuing with default)");
+    } else {
+        info!(send_buf_size = SEND_BUF_SIZE, "send socket buffer configured");
+    }
+
     let send_fd = send_sock.as_raw_fd();
 
-    // Set up poll fd for the AF_XDP socket
+    // Set up poll fd for the AF_XDP socket (fallback when idle)
     let mut pollfd = libc::pollfd {
         fd: xsk.raw_fd(),
         events: libc::POLLIN,
@@ -790,47 +1022,126 @@ fn af_xdp_worker(
 
     info!(listener = %name, "entering AF_XDP receive loop");
 
-    let mut rx_batch: Vec<(u64, u32)> = Vec::with_capacity(64);
-    let mut refill_addrs: Vec<u64> = Vec::with_capacity(64);
+    let mut rx_batch: Vec<(u64, u32)> = Vec::with_capacity(MAX_BATCH_SIZE as usize);
+    let mut refill_addrs: Vec<u64> = Vec::with_capacity(MAX_BATCH_SIZE as usize);
+    let mut local_stats = LocalStats::new();
+
+    // Pre-allocated sendmmsg buffers
+    let mut send_iovecs: Vec<libc::iovec> = Vec::with_capacity(MAX_BATCH_SIZE as usize);
+    let mut send_msgs: Vec<libc::mmsghdr> = Vec::with_capacity(MAX_BATCH_SIZE as usize);
+
+    // Cached downstream sockaddrs: (SocketAddr, socket2::SockAddr)
+    // Rebuilt only when the downstream snapshot changes (detected via data pointer).
+    let mut cached_ds: Vec<(SocketAddr, socket2::SockAddr)> = Vec::new();
+    let mut cached_ds_data_ptr: *const SocketAddr = std::ptr::null();
+    let mut cached_ds_len: usize = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Poll for incoming packets (100ms timeout for shutdown check)
-        pollfd.revents = 0;
-        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, 100) };
-        if poll_ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
+        // --- Busy-spin on RX ring before falling back to poll() ---
+        let mut received = 0;
+        for _ in 0..BUSY_SPIN_ITERS {
+            received = xsk.poll_rx(&mut rx_batch);
+            if received > 0 {
+                break;
+            }
+            // Pause hint — reduces power consumption and pipeline stalls
+            core::hint::spin_loop();
+        }
+
+        if received == 0 {
+            // Nothing after busy-spin — fall back to poll() with short timeout
+            // This avoids burning 100% CPU when there's no traffic.
+            pollfd.revents = 0;
+            let poll_ret = unsafe { libc::poll(&mut pollfd, 1, 10) };
+            if poll_ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
+            }
+            if poll_ret == 0 {
+                // Timeout — check shutdown and retry
                 continue;
             }
-            return Err(err.into());
+
+            // poll() says data ready — read it
+            received = xsk.poll_rx(&mut rx_batch);
+            if received == 0 {
+                stats.rx_ring_empty.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         }
-        if poll_ret == 0 {
-            // Timeout — check shutdown and retry
+
+        // --- Load downstream snapshot once per batch ---
+        let ds_guard = downstreams.load();
+        let ds_snapshot: &Vec<SocketAddr> = &*ds_guard;
+
+        if ds_snapshot.is_empty() {
+            // No healthy downstreams — drop entire batch
+            local_stats.pkts_received += received as u64;
+            local_stats.pkts_no_healthy += received as u64;
+            local_stats.pkts_dropped += received as u64;
+            for &(addr, len) in &rx_batch {
+                local_stats.bytes_received += len as u64;
+                refill_addrs.push(addr);
+            }
+            // Refill and flush
+            if !refill_addrs.is_empty() {
+                if let Err(e) = xsk.refill(&refill_addrs) {
+                    warn!(error = %e, "failed to refill AF_XDP ring");
+                    stats.fill_ring_full.fetch_add(1, Ordering::Relaxed);
+                }
+                refill_addrs.clear();
+            }
+            local_stats.flush(stats);
             continue;
         }
 
-        // Read available packets from RX ring
-        let received = xsk.poll_rx(&mut rx_batch);
-        if received == 0 {
-            stats.rx_ring_empty.fetch_add(1, Ordering::Relaxed);
-            continue;
+        // --- Update cached sockaddrs if downstream snapshot changed ---
+        // Compare the Vec's underlying data pointer (stable for the same allocation).
+        let ds_new_data_ptr = ds_snapshot.as_ptr();
+        let ds_new_len = ds_snapshot.len();
+        if ds_new_data_ptr != cached_ds_data_ptr || ds_new_len != cached_ds_len {
+            cached_ds.clear();
+            for addr in ds_snapshot.iter() {
+                cached_ds.push((*addr, (*addr).into()));
+            }
+            cached_ds_data_ptr = ds_new_data_ptr;
+            cached_ds_len = ds_new_len;
         }
 
+        // --- Parse batch and prepare sendmmsg ---
+        send_iovecs.clear();
+        send_msgs.clear();
         refill_addrs.clear();
 
+        // Track which parsed packets are ready to send
+        // We need to keep payload slices alive (they reference UMEM), so we
+        // collect (offset, len, dst_idx) tuples first.
+        struct SendEntry {
+            /// Index into rx_batch for UMEM refill tracking
+            payload_ptr: *const u8,
+            payload_len: usize,
+            ds_idx: usize,
+        }
+
+        let mut send_entries: Vec<SendEntry> = Vec::with_capacity(received);
+
+        let ds_len = cached_ds.len();
+
         for &(addr, len) in &rx_batch {
-            // Get the frame data from UMEM
             let frame = xsk.packet_data(addr, len);
 
-            stats.pkts_received.fetch_add(1, Ordering::Relaxed);
-            stats.bytes_received.fetch_add(len as u64, Ordering::Relaxed);
+            local_stats.pkts_received += 1;
+            local_stats.bytes_received += len as u64;
 
             // Parse headers and extract UDP payload
             let (payload_offset, payload_len) = match parse_udp_payload(frame) {
                 Some(p) => p,
                 None => {
-                    stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                    stats.pkts_dropped.fetch_add(1, Ordering::Relaxed);
+                    local_stats.parse_errors += 1;
+                    local_stats.pkts_dropped += 1;
                     refill_addrs.push(addr);
                     continue;
                 }
@@ -839,76 +1150,86 @@ fn af_xdp_worker(
             let payload = &frame[payload_offset..payload_offset + payload_len];
 
             // Round-robin to one downstream
-            let snapshot = downstreams.load();
-            if snapshot.is_empty() {
-                stats.pkts_no_healthy.fetch_add(1, Ordering::Relaxed);
-                stats.pkts_dropped.fetch_add(1, Ordering::Relaxed);
-                refill_addrs.push(addr);
-                continue;
+            let idx = (rr_counter.fetch_add(1, Ordering::Relaxed) as usize) % ds_len;
+
+            send_entries.push(SendEntry {
+                payload_ptr: payload.as_ptr(),
+                payload_len,
+                ds_idx: idx,
+            });
+
+            // Don't refill yet — payload references UMEM memory
+        }
+
+        // --- Build sendmmsg batch ---
+        // SAFETY: payload_ptr points into UMEM which stays mapped for lifetime of xsk
+        for entry in &send_entries {
+            send_iovecs.push(libc::iovec {
+                iov_base: entry.payload_ptr as *mut libc::c_void,
+                iov_len: entry.payload_len,
+            });
+        }
+
+        // Build mmsghdr array referencing iovecs and cached sockaddrs
+        for (i, entry) in send_entries.iter().enumerate() {
+            let sockaddr = &cached_ds[entry.ds_idx].1;
+            let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            hdr.msg_hdr.msg_iov = &mut send_iovecs[i] as *mut libc::iovec;
+            hdr.msg_hdr.msg_iovlen = 1;
+            hdr.msg_hdr.msg_name = sockaddr.as_ptr() as *mut libc::c_void;
+            hdr.msg_hdr.msg_namelen = sockaddr.len() as libc::socklen_t;
+            send_msgs.push(hdr);
+        }
+
+        // --- Fire the batch with a single sendmmsg() syscall ---
+        if !send_msgs.is_empty() {
+            let sent = unsafe {
+                libc::sendmmsg(
+                    send_fd,
+                    send_msgs.as_mut_ptr(),
+                    send_msgs.len() as libc::c_uint,
+                    libc::MSG_DONTWAIT as libc::c_int,
+                )
+            };
+
+            if sent < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock {
+                    warn!(error = %err, "AF_XDP sendmmsg error");
+                }
+                // All packets in this batch are dropped
+                local_stats.pkts_dropped += send_entries.len() as u64;
+            } else {
+                let sent = sent as usize;
+                // Count sent packets
+                for i in 0..sent {
+                    local_stats.pkts_forwarded += 1;
+                    local_stats.bytes_forwarded += send_entries[i].payload_len as u64;
+                }
+                // Count unsent (partial send)
+                if sent < send_entries.len() {
+                    local_stats.pkts_dropped += (send_entries.len() - sent) as u64;
+                }
             }
+        }
 
-            let idx = (rr_counter.fetch_add(1, Ordering::Relaxed) as usize) % snapshot.len();
-            let dst = snapshot[idx];
-
-            match sendto_one(send_fd, payload, dst) {
-                Ok(true) => {
-                    stats.pkts_forwarded.fetch_add(1, Ordering::Relaxed);
-                    stats
-                        .bytes_forwarded
-                        .fetch_add(payload_len as u64, Ordering::Relaxed);
-                }
-                Ok(false) => {
-                    // EAGAIN — drop
-                    stats.pkts_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    warn!(error = %e, "AF_XDP sendto error");
-                    stats.pkts_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-
-            // Mark frame for refill
+        // --- Now refill ALL frames (including ones we sent from) ---
+        for &(addr, _) in &rx_batch {
             refill_addrs.push(addr);
         }
 
-        // Return consumed frames to fill ring
         if !refill_addrs.is_empty() {
             if let Err(e) = xsk.refill(&refill_addrs) {
                 warn!(error = %e, "failed to refill AF_XDP ring");
                 stats.fill_ring_full.fetch_add(1, Ordering::Relaxed);
             }
+            refill_addrs.clear();
         }
+
+        // --- Flush local stats to shared atomics ---
+        local_stats.flush(stats);
     }
 
     info!(listener = %name, "AF_XDP receive loop exited");
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Send a single UDP packet to one destination (no allocation).
-fn sendto_one(fd: RawFd, pkt: &[u8], addr: SocketAddr) -> Result<bool> {
-    let sockaddr: socket2::SockAddr = addr.into();
-    let ret = unsafe {
-        libc::sendto(
-            fd,
-            pkt.as_ptr() as *const libc::c_void,
-            pkt.len(),
-            libc::MSG_DONTWAIT,
-            sockaddr.as_ptr(),
-            sockaddr.len() as libc::socklen_t,
-        )
-    };
-
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(false);
-        }
-        return Err(err.into());
-    }
-
-    Ok(true)
 }
