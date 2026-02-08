@@ -5,7 +5,7 @@ members = [
     "udp-fanout-common",
     "xtask",
 ]
-exclude = ["udp-fanout-ebpf", "udp-fanout-ebpf-xdp"]
+exclude = ["udp-fanout-ebpf", "udp-fanout-ebpf-xdp-src"]
 
 # eBPF crate is built separately via xtask (needs bpf target)
 # "udp-fanout-ebpf" is NOT a workspace member

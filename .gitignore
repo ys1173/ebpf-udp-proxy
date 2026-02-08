@@ -21,3 +21,4 @@ envoy-main/
 
 # Old scaffold
 udp-fanout-new/
+udp-fanout-ebpf-xdp

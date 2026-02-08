@@ -243,6 +243,179 @@ docker build -t ebpf-udp-proxy:latest .
 └── Dockerfile                   # Multi-stage container build
 ```
 
+## Performance Tuning
+
+### AF_XDP Mode Performance Characteristics
+
+AF_XDP mode achieves **~30,000 packets/sec per core** at maximum CPU utilization. Performance scales linearly with the number of cores when properly configured with RSS (Receive Side Scaling).
+
+**Tested Performance (AWS t3.medium, 2 cores, native XDP)**:
+- 30k pkt/sec: 1 core @ ~100% CPU
+- 60k pkt/sec: 2 cores @ ~100% CPU (requires RSS and multi-source traffic)
+- 120k+ pkt/sec: 4+ cores (requires larger instance)
+
+### Native XDP Requirements (AWS ENA Driver)
+
+For **native XDP mode** (driver-level packet interception), the AWS ENA driver requires:
+
+1. **MTU ≤ 3498 bytes** (jumbo frames not supported with XDP)
+   ```bash
+   sudo ip link set ens5 mtu 3498
+   ```
+
+2. **Queue count ≤ 50% of max queues**
+   ```bash
+   # Check max queues
+   ethtool -l ens5
+
+   # If max=2, set to 1 for native XDP
+   sudo ethtool -L ens5 combined 1
+
+   # If max=4+, set to 2 for dual-core processing
+   sudo ethtool -L ens5 combined 2
+   ```
+
+3. **Minimum instance size**: t3.medium or larger
+   - For **multi-core** (2+ queues with XDP): Requires 4+ max queues
+   - Recommended: **c5n.large** or **c6i.large** (4 queues → 2 XDP queues)
+
+**Startup logs verify native XDP**:
+```
+INFO attached XDP program interface="ens5" mode="native"  ✓ Good
+WARN native XDP attach failed, trying SKB mode            ✗ Falls back to slower mode
+```
+
+### Multi-Core Scaling
+
+The proxy automatically detects available RX queues and spawns one AF_XDP forwarder per queue. Each forwarder runs on a separate core.
+
+**Current config** (1 listener → N cores):
+```yaml
+listeners:
+  - name: "vector-af-xdp"
+    mode: af_xdp
+    bind: "172.31.25.200:514"
+    interface: "ens5"
+```
+
+With 2 queues available, this automatically creates:
+- `vector-af-xdp-q0` on queue 0
+- `vector-af-xdp-q1` on queue 1
+
+**Startup logs**:
+```
+INFO detected available RX queues on interface num_queues=2
+INFO AF_XDP path initialized listeners=1 forwarders=2 queues_per_listener=2
+```
+
+### RSS (Receive Side Scaling) Configuration
+
+Multi-core performance requires **RSS** to distribute packets across queues. RSS hashes incoming packets based on the 5-tuple (src IP, src port, dst IP, dst port, protocol).
+
+**Key insight**: Traffic from a **single source IP** will hash to the **same queue**, utilizing only one core. To activate all cores:
+- Send from **multiple source IPs** (e.g., multiple log generators)
+- Use different **source ports** in your application
+- Distribute traffic from multiple hosts
+
+**Check RSS distribution**:
+```bash
+# View RSS hash configuration
+ethtool -x ens5
+
+# Monitor per-queue packet counts
+ethtool -S ens5 | grep "queue.*packets"
+
+# Check per-queue interrupts
+cat /proc/interrupts | grep ens5
+```
+
+**Verify multi-core utilization**:
+```bash
+# Show per-thread CPU usage
+top -H -p $(pgrep udp-fanout)
+
+# Should see multiple "afxdp-" threads with ~100% CPU each
+```
+
+### Locked Memory Limits
+
+AF_XDP requires elevated locked memory limits for UMEM (shared packet buffers):
+```bash
+ulimit -l unlimited
+sudo ./target/release/udp-fanout --config config.yaml
+```
+
+Or set system-wide in `/etc/security/limits.conf`:
+```
+* soft memlock unlimited
+* hard memlock unlimited
+```
+
+### Performance Optimization Checklist
+
+**For maximum throughput**:
+- ✅ Use **native XDP mode** (not SKB)
+- ✅ Configure MTU ≤ 3498 and queues ≤ 50% of max
+- ✅ Use instance with **4+ queues** for multi-core (c5n.large+)
+- ✅ Send traffic from **multiple sources** to activate RSS
+- ✅ Enable `--release` build for optimized binaries
+- ✅ Pin process to NUMA node if on multi-socket system
+- ✅ Consider disabling IRQ balance for dedicated cores
+
+**Monitor performance**:
+```bash
+# Real-time packet rate (per queue)
+watch -n1 'ethtool -S ens5 | grep queue.*packets'
+
+# CPU per thread
+top -H -p $(pgrep udp-fanout)
+
+# Prometheus metrics
+curl localhost:9090/metrics | grep udp_fanout
+```
+
+### Exposing to External Traffic
+
+To receive logs from outside AWS:
+
+1. **Configure iptables DNAT** to forward public IP traffic to MetalLB VIP:
+   ```bash
+   PUBLIC_IP=172.31.25.67  # Instance private IP
+   VIP=172.31.25.200       # MetalLB VIP
+   PORT=514
+
+   sudo iptables -t nat -A PREROUTING -d $PUBLIC_IP -p udp --dport $PORT \
+     -j DNAT --to-destination $VIP:$PORT
+   sudo iptables -t nat -A POSTROUTING -d $VIP -p udp --dport $PORT \
+     -j MASQUERADE
+   ```
+
+2. **Configure AWS Security Group** to allow inbound UDP on port 514 from your source IPs
+
+3. **Send logs to instance public IP**:
+   ```bash
+   echo "test log" | nc -u <EC2_PUBLIC_IP> 514
+   ```
+
+### Troubleshooting Performance
+
+**Problem**: Only one core utilized
+- **Cause**: All traffic from single source IP hashes to one queue
+- **Solution**: Send from multiple source IPs or accept single-core performance
+
+**Problem**: Native XDP fails to attach
+- **Cause**: MTU > 3498 or queue count > 50% of max
+- **Solution**: Reduce MTU and queue count as documented above
+
+**Problem**: SKB mode instead of native
+- **Check**: `dmesg | grep xdp` for error messages
+- **Check**: Queue and MTU settings with `ethtool`
+
+**Problem**: Lower than expected throughput
+- **Check**: CPU usage with `top -H` - should be near 100% per thread
+- **Check**: RSS distribution with `ethtool -S ens5`
+- **Check**: No packet drops in metrics (`udp_fanout_packets_dropped_total`)
+
 ## Limitations
 
 - UDP only — TCP is not supported (use kube-proxy or a general-purpose L4 proxy for TCP)

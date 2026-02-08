@@ -139,7 +139,7 @@ fn build_ebpf(release: bool) -> Result<()> {
 /// Same toolchain requirements as build_ebpf.
 fn build_ebpf_xdp(release: bool) -> Result<()> {
     let root = workspace_root();
-    let xdp_dir = root.join("udp-fanout-ebpf-xdp");
+    let xdp_dir = root.join("udp-fanout-ebpf-xdp-src");
 
     println!("=> Building XDP eBPF program...");
 
