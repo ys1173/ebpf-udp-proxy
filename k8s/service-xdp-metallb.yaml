@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-fanout-lb
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-fanout
+  annotations:
+    metallb.io/address-pool: udp-proxy-pool
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 10.168.100.97
+  # MetalLB will assign 10.168.100.97 from our IPAddressPool
+  # External clients send traffic to this VIP
+  ports:
+    - name: syslog
+      port: 40514
+      targetPort: 40514
+      protocol: UDP
+  selector:
+    app.kubernetes.io/name: udp-fanout
+  # Selector matches the udp-fanout DaemonSet pods
+  # Traffic goes to hostNetwork pods where XDP intercepts it

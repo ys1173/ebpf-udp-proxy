@@ -63,7 +63,7 @@ fn try_redirect(ctx: &XdpContext) -> Result<u32, ()> {
 
     // --- Parse Ethernet header ---
     // EtherType is at offset 12, 2 bytes
-    let ether_type = u16::from_be(unsafe { *(data as *const u8).add(12).cast::<u16>().read_unaligned() });
+    let ether_type = u16::from_be(unsafe { (data as *const u8).add(12).cast::<u16>().read_unaligned() });
     if ether_type != ETH_P_IP {
         return Ok(xdp_action::XDP_PASS);
     }
@@ -96,7 +96,7 @@ fn try_redirect(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     // UDP destination port at offset 2 (network byte order)
-    let udp_dst_port: u16 = unsafe { *(udp_start as *const u8).add(2).cast::<u16>().read_unaligned() };
+    let udp_dst_port: u16 = unsafe { (udp_start as *const u8).add(2).cast::<u16>().read_unaligned() };
 
     // --- Lookup port in filter map ---
     // Port is stored in network byte order for direct comparison
@@ -105,11 +105,9 @@ fn try_redirect(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     // --- Redirect to AF_XDP socket ---
-    // Use the RX queue index to find the correct AF_XDP socket in XSKMAP.
-    // The fallback action (XDP_PASS) ensures packets go to the kernel if
-    // no AF_XDP socket is registered for this queue.
-    let queue_idx = ctx.rx_queue_index();
-    match XSKMAP.redirect(queue_idx, 0) {
+    // Use queue index 0 for single-queue AF_XDP setup.
+    // In multi-queue setups, this could be derived from packet hash or RSS.
+    match XSKMAP.redirect(0, 0) {
         Ok(action) => Ok(action),
         Err(_) => Ok(xdp_action::XDP_PASS),
     }

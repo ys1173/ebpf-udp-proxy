@@ -1,0 +1,17 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: udp-proxy-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 10.168.100.97/32
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: udp-proxy-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - udp-proxy-pool

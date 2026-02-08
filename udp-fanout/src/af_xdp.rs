@@ -52,9 +52,9 @@ const UMEM_SIZE: usize = (NUM_FRAMES * FRAME_SIZE) as usize;
 const SOL_XDP: i32 = 283;
 const XDP_MMAP_OFFSETS: i32 = 1;
 const XDP_RX_RING: i32 = 2;
-const XDP_UMEM_REG: i32 = 3;
-const XDP_UMEM_FILL_RING: i32 = 4;
-const XDP_UMEM_COMPLETION_RING: i32 = 5;
+const XDP_UMEM_REG: i32 = 4;
+const XDP_UMEM_FILL_RING: i32 = 5;
+const XDP_UMEM_COMPLETION_RING: i32 = 6;
 const XDP_STATISTICS: i32 = 7;
 
 // mmap page offsets for each ring

@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: udp-fanout-config
+  namespace: udp-fanout
+  labels:
+    app.kubernetes.io/name: udp-fanout
+data:
+  config.yaml: |
+    listeners:
+      - name: syslog
+        bind: "0.0.0.0:40514"
+        interface: eno1                # Physical NIC for XDP attachment
+        mode: af_xdp                   # AF_XDP mode for MetalLB compatibility
+        kubernetes:
+          namespace: udp-fanout        # Namespace where receivers are deployed
+          service: udp-receivers       # Headless Service name
+          port: 40514                  # Receiver port
+
+    # Health checks: Keep ARP entries warm for receivers
+    health:
+      enabled: true
+      interval_secs: 5
+      timeout_secs: 2
+      protocol: icmp
+
+    # Metrics: Prometheus endpoint
+    metrics:
+      enabled: true
+      bind: "0.0.0.0:9090"
+      path: /metrics

@@ -4,5 +4,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY target/release/udp-fanout /opt/udp-fanout/udp-fanout
 COPY target/udp-fanout-ebpf /opt/udp-fanout/udp-fanout-ebpf
+COPY target/udp-fanout-ebpf-xdp /opt/udp-fanout/udp-fanout-ebpf-xdp
 ENTRYPOINT ["/opt/udp-fanout/udp-fanout"]
-CMD ["--config", "/etc/udp-fanout/config.yaml", "--ebpf-program", "/opt/udp-fanout/udp-fanout-ebpf"]
+CMD ["--config", "/etc/udp-fanout/config.yaml", "--xdp-program", "/opt/udp-fanout/udp-fanout-ebpf-xdp"]
