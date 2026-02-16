@@ -1,10 +1,11 @@
 //! udp-fanout: Lightweight high-performance UDP fanout proxy.
 //!
 //! Replicates incoming UDP datagrams to multiple downstream receivers using
-//! three forwarding paths:
-//!   - tc_ebpf:   kernel-only forwarding via TC eBPF + bpf_redirect_neigh (fastest)
-//!   - af_xdp:    zero-copy receive via AF_XDP + userspace sendto (MetalLB compatible)
-//!   - userspace: pure userspace with recvmmsg/sendmmsg batching (portable fallback)
+//! four forwarding paths:
+//!   - tc_ebpf:     kernel-only forwarding via TC eBPF + bpf_redirect_neigh (fastest)
+//!   - af_xdp:      zero-copy receive via AF_XDP + userspace sendto (MetalLB compatible)
+//!   - userspace:   pure userspace with recvmmsg/sendmmsg batching (portable fallback)
+//!   - tcp_forward: UDP receive → TCP forward with persistent connections (reliable delivery)
 //!
 //! Designed for market data distribution, telemetry replication, and similar
 //! high-throughput UDP forwarding workloads.
@@ -15,6 +16,7 @@ mod ebpf_manager;
 mod health;
 mod kubernetes;
 mod metrics;
+mod tcp_forward;
 mod userspace;
 mod xdp_manager;
 
@@ -31,6 +33,7 @@ use af_xdp::AfXdpForwarder;
 use config::{Config, ForwardingMode};
 use ebpf_manager::EbpfManager;
 use metrics::MetricsState;
+use tcp_forward::TcpForwarder;
 use userspace::UserspaceForwarder;
 use xdp_manager::XdpManager;
 
@@ -67,55 +70,6 @@ struct Cli {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-
-/// Detect the number of RX queues available on the network interface.
-/// Returns 1 if detection fails.
-fn detect_num_queues(ifindex: u32) -> Result<u32> {
-    // Get interface name from ifindex
-    let mut ifname = [0u8; libc::IF_NAMESIZE];
-    let name_ptr = unsafe {
-        libc::if_indextoname(ifindex, ifname.as_mut_ptr() as *mut i8)
-    };
-
-    if name_ptr.is_null() {
-        warn!("failed to get interface name for ifindex {}", ifindex);
-        return Ok(1);
-    }
-
-    let ifname_str = unsafe {
-        std::ffi::CStr::from_ptr(ifname.as_ptr() as *const i8)
-            .to_str()
-            .unwrap_or("unknown")
-    };
-
-    // Try to read from /sys/class/net/{iface}/queues/
-    let queues_path = format!("/sys/class/net/{}/queues", ifname_str);
-    let entries = match std::fs::read_dir(&queues_path) {
-        Ok(entries) => entries,
-        Err(_) => {
-            warn!("failed to read {}, using single queue", queues_path);
-            return Ok(1);
-        }
-    };
-
-    // Count rx-* directories
-    let num_queues = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|s| s.starts_with("rx-"))
-                .unwrap_or(false)
-        })
-        .count() as u32;
-
-    if num_queues == 0 {
-        warn!("no rx queues found in {}, using single queue", queues_path);
-        Ok(1)
-    } else {
-        Ok(num_queues)
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -160,10 +114,17 @@ async fn main() -> Result<()> {
         .filter(|l| l.mode == ForwardingMode::Userspace)
         .collect();
 
+    let tcp_forward_listeners: Vec<&_> = config
+        .listeners
+        .iter()
+        .filter(|l| l.mode == ForwardingMode::TcpForward)
+        .collect();
+
     info!(
         tc_ebpf = ebpf_listeners.len(),
         af_xdp = afxdp_listeners.len(),
         userspace = userspace_listeners.len(),
+        tcp_forward = tcp_forward_listeners.len(),
         "configured listeners by mode"
     );
 
@@ -226,47 +187,30 @@ async fn main() -> Result<()> {
             .attached_ifindex()
             .context("getting attached interface index")?;
 
-        // Detect number of queues available on the interface
-        let num_queues = detect_num_queues(ifindex).unwrap_or(1);
-        info!(
-            num_queues,
-            "detected available RX queues on interface"
-        );
+        // Start AF_XDP forwarders
+        for (i, listener) in afxdp_listeners.iter().enumerate() {
+            let queue_id = i as u32; // Each listener binds to a different RX queue
 
-        // Start AF_XDP forwarders (multi-threaded: one per queue per listener)
-        let mut total_forwarders = 0;
-        for listener in &afxdp_listeners {
-            for queue_id in 0..num_queues {
-                let forwarder_name = if num_queues > 1 {
-                    format!("{}-q{}", listener.name, queue_id)
-                } else {
-                    listener.name.clone()
-                };
+            let forwarder = AfXdpForwarder::start(listener, ifindex, queue_id)
+                .with_context(|| {
+                    format!("starting AF_XDP forwarder for '{}'", listener.name)
+                })?;
 
-                let forwarder = AfXdpForwarder::start(listener, ifindex, queue_id)
-                    .with_context(|| {
-                        format!("starting AF_XDP forwarder '{}' on queue {}", listener.name, queue_id)
-                    })?;
+            // Register the AF_XDP socket fd in the XSKMAP
+            mgr.register_xsk_socket(queue_id, forwarder.xsk_fd)
+                .with_context(|| {
+                    format!(
+                        "registering XSK socket for '{}' (queue {})",
+                        listener.name, queue_id
+                    )
+                })?;
 
-                // Register the AF_XDP socket fd in the XSKMAP
-                mgr.register_xsk_socket(queue_id, forwarder.xsk_fd)
-                    .with_context(|| {
-                        format!(
-                            "registering XSK socket for '{}' (queue {})",
-                            listener.name, queue_id
-                        )
-                    })?;
-
-                afxdp_stats_vec.push((forwarder_name, forwarder.stats.clone()));
-                afxdp_forwarders.push(forwarder);
-                total_forwarders += 1;
-            }
+            afxdp_stats_vec.push((listener.name.clone(), forwarder.stats.clone()));
+            afxdp_forwarders.push(forwarder);
         }
 
         info!(
             listeners = afxdp_listeners.len(),
-            forwarders = total_forwarders,
-            queues_per_listener = num_queues,
             "AF_XDP path initialized"
         );
 
@@ -283,6 +227,18 @@ async fn main() -> Result<()> {
 
         userspace_stats_vec.push((listener.name.clone(), forwarder.stats.clone()));
         userspace_forwarders.push(forwarder);
+    }
+
+    // --- Start TCP forward forwarders ---
+    let mut tcp_forwarders: Vec<TcpForwarder> = Vec::new();
+    let mut tcp_stats_vec: Vec<(String, Arc<tcp_forward::TcpForwardStats>)> = Vec::new();
+
+    for listener in &tcp_forward_listeners {
+        let forwarder = TcpForwarder::start(listener)
+            .with_context(|| format!("starting tcp_forward forwarder for '{}'", listener.name))?;
+
+        tcp_stats_vec.push((listener.name.clone(), forwarder.stats.clone()));
+        tcp_forwarders.push(forwarder);
     }
 
     // --- Start health checker ---
@@ -303,6 +259,7 @@ async fn main() -> Result<()> {
             ebpf_manager: ebpf_manager.clone(),
             userspace_stats: Arc::new(userspace_stats_vec),
             afxdp_stats: Arc::new(afxdp_stats_vec),
+            tcp_stats: Arc::new(tcp_stats_vec),
             num_ebpf_listeners: ebpf_listeners.len() as u32,
             ebpf_listener_names: Arc::new(
                 ebpf_listeners.iter().map(|l| l.name.clone()).collect(),
@@ -340,6 +297,11 @@ async fn main() -> Result<()> {
 
     // Stop userspace forwarders
     for forwarder in userspace_forwarders {
+        forwarder.shutdown();
+    }
+
+    // Stop TCP forward forwarders
+    for forwarder in tcp_forwarders {
         forwarder.shutdown();
     }
 

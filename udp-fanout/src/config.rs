@@ -73,6 +73,21 @@ pub enum ForwardingMode {
     /// Pure userspace with recvmmsg/sendmmsg.
     #[default]
     Userspace,
+    /// UDP receive → TCP forward with persistent connections.
+    TcpForward,
+}
+
+/// TCP framing mode for tcp_forward mode.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpFramingMode {
+    /// Each message terminated by newline. Compatible with Vector `socket` source.
+    #[default]
+    Newline,
+    /// RFC 6587 octet-counting: "<length> <message>". Compatible with Vector `syslog` TCP source.
+    OctetCounting,
+    /// 4-byte big-endian length prefix + payload. For binary-safe framing.
+    LengthPrefix,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +149,24 @@ pub struct ListenerSettings {
     /// Socket receive buffer size. 0 = system default.
     #[serde(default)]
     pub recv_buf_size: usize,
+
+    // --- TCP forward settings (only used when mode = tcp_forward) ---
+
+    /// TCP framing mode for message boundaries.
+    #[serde(default)]
+    pub tcp_framing: TcpFramingMode,
+
+    /// Per-connection userspace write buffer size in bytes.
+    #[serde(default = "default_tcp_send_buf_size")]
+    pub tcp_send_buf_size: usize,
+
+    /// TCP connect timeout in milliseconds.
+    #[serde(default = "default_tcp_connect_timeout_ms")]
+    pub tcp_connect_timeout_ms: u64,
+
+    /// TCP_NODELAY (disable Nagle's algorithm) for low-latency sends.
+    #[serde(default = "default_true")]
+    pub tcp_nodelay: bool,
 }
 
 impl Default for ListenerSettings {
@@ -145,6 +178,10 @@ impl Default for ListenerSettings {
             workers: 0,
             pin_cpus: true,
             recv_buf_size: 0,
+            tcp_framing: TcpFramingMode::default(),
+            tcp_send_buf_size: default_tcp_send_buf_size(),
+            tcp_connect_timeout_ms: default_tcp_connect_timeout_ms(),
+            tcp_nodelay: true,
         }
     }
 }
@@ -160,6 +197,12 @@ fn default_batch_size() -> usize {
 }
 fn default_true() -> bool {
     true
+}
+fn default_tcp_send_buf_size() -> usize {
+    262144 // 256 KB per connection
+}
+fn default_tcp_connect_timeout_ms() -> u64 {
+    5000
 }
 
 // ---------------------------------------------------------------------------

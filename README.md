@@ -2,7 +2,7 @@
 
 High-performance UDP load-balancing proxy with eBPF kernel bypass for Kubernetes.
 
-Receives UDP datagrams on one or more listeners and forwards each packet to exactly one downstream receiver using round-robin selection. Three forwarding paths cover different deployment scenarios — from line-rate kernel-only forwarding to MetalLB-compatible AF_XDP to portable userspace fallback.
+Receives UDP datagrams on one or more listeners and forwards each packet to exactly one downstream receiver using round-robin selection. Four forwarding paths cover different deployment scenarios — from line-rate kernel-only forwarding to MetalLB-compatible AF_XDP to portable userspace fallback to UDP-to-TCP conversion for reliable downstream delivery.
 
 ## Forwarding Modes
 
@@ -36,6 +36,22 @@ Pure userspace path using `recvmmsg`/`sendmmsg` batched I/O with SO_REUSEPORT mu
 
 Best for: development, testing, or environments where eBPF is unavailable.
 
+### TCP Forward (`tcp_forward`)
+
+Receives UDP datagrams via `recvmmsg` batched I/O and forwards each packet over persistent TCP connections to downstream receivers. Each worker thread owns its own TCP connection pool with zero lock contention in the hot path. BufWriter coalesces small writes into efficient TCP segments, flushed after each receive batch.
+
+Key characteristics:
+
+- **Persistent TCP connections** with lazy reconnect and exponential backoff (100ms → 2s cap)
+- **Per-worker connection pools** — no locks, no contention between workers
+- **Configurable framing** — newline (Vector `socket` source), octet-counting (RFC 6587 syslog), or 4-byte length-prefix (binary-safe)
+- **Fire-and-forget on write error** — drop packet and count it, matching UDP semantics
+- **BufWriter with batch flush** — writes accumulate during a receive batch, then flush once
+- **TCP_NODELAY** configurable for latency-sensitive workloads
+- **No eBPF required** — pure stable Rust, no nightly toolchain, no CAP_BPF
+
+Best for: forwarding UDP telemetry/syslog to TCP-based collectors like Vector, Fluentd, or Logstash where reliable delivery is preferred over raw throughput.
+
 ## Features
 
 - **Round-robin load balancing**: One packet → one downstream, cycling through available receivers. Per-CPU counters (eBPF) or atomics (userspace/AF_XDP) for lock-free distribution
@@ -48,19 +64,21 @@ Best for: development, testing, or environments where eBPF is unavailable.
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────┐
-                    │              Forwarding Modes                │
-                    ├─────────────┬──────────────┬────────────────┤
-                    │  TC eBPF    │   AF_XDP     │   Userspace    │
-                    │             │              │                │
-  Incoming UDP ───► │ TC ingress  │ XDP hook     │ recvmmsg()     │
-                    │ FIB lookup  │ XSKMAP redir │ on UDP socket  │
-                    │ redirect_   │ UMEM rx ring │                │
-                    │ neigh()     │ busy-spin +  │                │
-                    │             │ parse headers│                │
-  Outgoing UDP ◄── │ direct to   │ sendmmsg()   │ sendto()       │
-                    │ pod veth    │ round-robin  │ round-robin    │
-                    └─────────────┴──────────────┴────────────────┘
+                    ┌──────────────────────────────────────────────────────────────┐
+                    │                      Forwarding Modes                        │
+                    ├─────────────┬──────────────┬────────────────┬────────────────┤
+                    │  TC eBPF    │   AF_XDP     │   Userspace    │  TCP Forward   │
+                    │             │              │                │                │
+  Incoming UDP ───► │ TC ingress  │ XDP hook     │ recvmmsg()     │ recvmmsg()     │
+                    │ FIB lookup  │ XSKMAP redir │ on UDP socket  │ on UDP socket  │
+                    │ redirect_   │ UMEM rx ring │                │                │
+                    │ neigh()     │ busy-spin +  │                │ frame message  │
+                    │             │ parse headers│                │ (newline/octet/│
+                    │             │              │                │  length-prefix)│
+                    │             │              │                │                │
+    Outgoing ◄──── │ UDP direct  │ UDP sendmmsg │ UDP sendto     │ TCP BufWriter  │
+                    │ to pod veth │ round-robin  │ round-robin    │ round-robin    │
+                    └─────────────┴──────────────┴────────────────┴────────────────┘
                                         │
                             ┌───────────┼───────────┐
                          pod-1       pod-2       pod-3
@@ -181,6 +199,30 @@ metrics:
   bind: "0.0.0.0:9090"
 ```
 
+### TCP Forward to Vector
+
+```yaml
+listeners:
+  - name: syslog-tcp
+    bind: "0.0.0.0:5514"
+    mode: tcp_forward
+    kubernetes:
+      namespace: logging
+      service: vector-receivers
+      port: 5514
+    settings:
+      tcp_framing: newline          # newline | octet_counting | length_prefix
+      tcp_send_buf_size: 262144     # 256 KB per-connection write buffer
+      tcp_connect_timeout_ms: 5000
+      tcp_nodelay: true
+      workers: 4
+      batch_size: 32
+
+metrics:
+  enabled: true
+  bind: "0.0.0.0:9090"
+```
+
 See [config.example.yaml](config.example.yaml) for all options including batch size, worker count, recv buffer size, and max packet size.
 
 ## Kubernetes Deployment
@@ -216,6 +258,11 @@ udp_fanout_bytes_forwarded_total{listener="syslog",mode="tc_ebpf"} 792149000
 udp_fanout_afxdp_rx_ring_empty_total{listener="market-data",mode="af_xdp"} 12
 udp_fanout_afxdp_fill_ring_full_total{listener="market-data",mode="af_xdp"} 0
 udp_fanout_afxdp_parse_errors_total{listener="market-data",mode="af_xdp"} 0
+
+# TCP forward-specific
+udp_fanout_tcp_connections_active{listener="syslog-tcp",mode="tcp_forward"} 4
+udp_fanout_tcp_connection_errors_total{listener="syslog-tcp",mode="tcp_forward"} 2
+udp_fanout_tcp_write_errors_total{listener="syslog-tcp",mode="tcp_forward"} 0
 ```
 
 ## Docker Build
@@ -235,6 +282,7 @@ docker build -t ebpf-udp-proxy:latest .
 │       ├── af_xdp.rs            # AF_XDP socket, UMEM, ring buffers, forwarding
 │       ├── xdp_manager.rs       # XDP program loading and XSKMAP management
 │       ├── ebpf_manager.rs      # TC eBPF program loading and map management
+│       ├── tcp_forward.rs       # UDP receive → TCP forward with persistent connections
 │       ├── userspace.rs         # recvmmsg/sendmmsg multi-worker forwarding
 │       ├── kubernetes.rs        # EndpointSlice watcher for downstream discovery
 │       ├── health.rs            # ICMP/UDP health probes
@@ -257,7 +305,7 @@ docker build -t ebpf-udp-proxy:latest .
 
 ## Limitations
 
-- UDP only — TCP is not supported (use kube-proxy or a general-purpose L4 proxy for TCP)
+- UDP ingress only — accepts UDP on the receive side (tcp_forward mode converts to TCP for downstream delivery)
 - Round-robin only — no weighted, least-connections, or hash-based balancing
 - Host network required — needs direct NIC access for TC/XDP attachment
 - Stateless — no connection tracking, no session affinity

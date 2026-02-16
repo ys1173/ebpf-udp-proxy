@@ -15,6 +15,7 @@ use tracing::info;
 use crate::af_xdp::AfXdpStats;
 use crate::config::MetricsConfig;
 use crate::ebpf_manager::EbpfManager;
+use crate::tcp_forward::TcpForwardStats;
 use crate::userspace::UserspaceStats;
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,8 @@ pub struct MetricsState {
     pub userspace_stats: Arc<Vec<(String, Arc<UserspaceStats>)>>,
     /// AF_XDP forwarding stats (one per listener in af_xdp mode).
     pub afxdp_stats: Arc<Vec<(String, Arc<AfXdpStats>)>>,
+    /// TCP forward stats (one per listener in tcp_forward mode).
+    pub tcp_stats: Arc<Vec<(String, Arc<TcpForwardStats>)>>,
     /// Number of eBPF-mode listeners (for iterating stats maps).
     pub num_ebpf_listeners: u32,
     /// Listener names for eBPF-mode listeners (indexed by listener_id).
@@ -82,6 +85,14 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     output.push_str("# TYPE udp_fanout_bytes_received_total counter\n");
     output.push_str("# HELP udp_fanout_bytes_forwarded_total Total bytes forwarded\n");
     output.push_str("# TYPE udp_fanout_bytes_forwarded_total counter\n");
+    output.push_str("# HELP udp_fanout_tcp_connections_active Current active TCP connections\n");
+    output.push_str("# TYPE udp_fanout_tcp_connections_active gauge\n");
+    output.push_str(
+        "# HELP udp_fanout_tcp_connection_errors_total Total TCP connection errors\n",
+    );
+    output.push_str("# TYPE udp_fanout_tcp_connection_errors_total counter\n");
+    output.push_str("# HELP udp_fanout_tcp_write_errors_total Total TCP write errors\n");
+    output.push_str("# TYPE udp_fanout_tcp_write_errors_total counter\n");
 
     // --- eBPF-mode listener stats ---
     if let Some(ref mgr) = *state.ebpf_manager.lock().await {
@@ -253,6 +264,75 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             name,
             "userspace",
             stats.bytes_forwarded.load(Relaxed),
+        );
+    }
+
+    // --- TCP forward-mode listener stats ---
+    for (name, stats) in state.tcp_stats.iter() {
+        use std::sync::atomic::Ordering::Relaxed;
+        write_metric(
+            &mut output,
+            "udp_fanout_packets_received_total",
+            name,
+            "tcp_forward",
+            stats.pkts_received.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_packets_forwarded_total",
+            name,
+            "tcp_forward",
+            stats.pkts_forwarded.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_packets_dropped_total",
+            name,
+            "tcp_forward",
+            stats.pkts_dropped.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_packets_no_healthy_total",
+            name,
+            "tcp_forward",
+            stats.pkts_no_downstream.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_bytes_received_total",
+            name,
+            "tcp_forward",
+            stats.bytes_received.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_bytes_forwarded_total",
+            name,
+            "tcp_forward",
+            stats.bytes_forwarded.load(Relaxed),
+        );
+        // TCP-specific metrics
+        write_metric(
+            &mut output,
+            "udp_fanout_tcp_connections_active",
+            name,
+            "tcp_forward",
+            stats.connections_active.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_tcp_connection_errors_total",
+            name,
+            "tcp_forward",
+            stats.connection_errors.load(Relaxed),
+        );
+        write_metric(
+            &mut output,
+            "udp_fanout_tcp_write_errors_total",
+            name,
+            "tcp_forward",
+            stats.write_errors.load(Relaxed),
         );
     }
 
